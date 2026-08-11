@@ -31,22 +31,30 @@ sys_platform = sys.platform
 
 # use pre-built libraries on Windows
 
+# The Windows build links against pre-built binaries from the
+# lxml/libxml2-win-binaries repository. Picking the newest release there is not
+# reproducible: releases published after this lxml version are built with newer
+# MSVC toolchains, whose object files the compiler of this era refuses to link
+# ("fatal error C1047: the object or library file ... was created by a different
+# version of the compiler", followed by "LNK1257: code generation failed").
+# Pin to the last release published before the lxml 4.9.4 release date
+# (2023-12-19); its binaries were built with a compatible toolchain.
+WINDOWS_BINARIES_RELEASE_TAG = "2022.12.31"
+
+
 def download_and_extract_windows_binaries(destdir):
-    url = "https://api.github.com/repos/lxml/libxml2-win-binaries/releases?per_page=5"
-    releases, _ = read_url(
+    release_tag = os.environ.get(
+        "LIBXML2_WIN_BINARIES_TAG", WINDOWS_BINARIES_RELEASE_TAG)
+    url = "https://api.github.com/repos/lxml/libxml2-win-binaries/releases/tags/%s" % release_tag
+    release, _ = read_url(
         url,
         accept="application/vnd.github+json",
         as_json=True,
         github_api_token=os.environ.get("GITHUB_API_TOKEN"),
     )
 
-    max_release = {'tag_name': ''}
-    for release in releases:
-        if max_release['tag_name'] < release.get('tag_name', ''):
-            max_release = release
-
-    url = "https://github.com/lxml/libxml2-win-binaries/releases/download/%s/" % max_release['tag_name']
-    filenames = [asset['name'] for asset in max_release.get('assets', ())]
+    url = "https://github.com/lxml/libxml2-win-binaries/releases/download/%s/" % release['tag_name']
+    filenames = [asset['name'] for asset in release.get('assets', ())]
 
     # Check for native ARM64 build or the environment variable that is set by
     # Visual Studio for cross-compilation (same variable as setuptools uses)
@@ -63,8 +71,27 @@ def download_and_extract_windows_binaries(destdir):
     arch_part = '.' + arch + '.'
     filenames = [filename for filename in filenames if arch_part in filename]
 
+    # Honour the LIBXML2_VERSION/LIBXSLT_VERSION pins when the pinned release
+    # actually ships that version, so that a pinned build stays reproducible.
+    # Otherwise fall back to the newest asset *within the pinned release*, which
+    # is still era-correct because the release itself is pinned above.
+    env_versions = {
+        'libxml2': os.environ.get('LIBXML2_VERSION'),
+        'libxslt': os.environ.get('LIBXSLT_VERSION'),
+    }
+
     libs = {}
     for libname in ['libxml2', 'libxslt', 'zlib', 'iconv']:
+        version = env_versions.get(libname)
+        if version:
+            filename = "%s-%s.%s.zip" % (libname, version, arch)
+            if filename in filenames:
+                print('Using pinned version of %s: %s' % (libname, version))
+                libs[libname] = filename
+                continue
+            print('Pinned version %s of %s is not available in release %s, '
+                  'using the newest version in that release instead' % (
+                      version, libname, release_tag))
         libs[libname] = "%s-%s.%s.zip" % (
             libname,
             find_max_version(libname, filenames),
@@ -140,6 +167,13 @@ LIBXSLT_LOCATION = 'https://download.gnome.org/sources/libxslt/'
 LIBICONV_LOCATION = 'https://ftp.gnu.org/pub/gnu/libiconv/'
 ZLIB_LOCATION = 'https://zlib.net/'
 match_libfile_version = re.compile('^[^-]*-([.0-9-]+)[.].*').match
+
+# Default versions for the bundled dependencies that have no explicit pin.
+# Without these, "newest available" is used, which makes the build depend on
+# the day it runs: the wheels published for this lxml release embed zlib 1.3
+# and libiconv 1.17, so those are the era-correct defaults.
+DEFAULT_ZLIB_VERSION = '1.3'
+DEFAULT_LIBICONV_VERSION = '1.17'
 
 
 def _find_content_encoding(response, default='iso8859-1'):
@@ -294,20 +328,36 @@ def download_libxslt(dest_dir, version=None):
                             version_re, filename, version=version)
 
 
-def download_libiconv(dest_dir, version=None):
+def download_libiconv(dest_dir, version=DEFAULT_LIBICONV_VERSION):
     """Downloads libiconv, returning the filename where the library was downloaded"""
+    if version is None:
+        version = DEFAULT_LIBICONV_VERSION
     version_re = re.compile(r'libiconv-([0-9.]+[0-9]).tar.gz')
     filename = 'libiconv-%s.tar.gz'
     return download_library(dest_dir, LIBICONV_LOCATION, 'libiconv',
                             version_re, filename, version=version)
 
 
-def download_zlib(dest_dir, version):
+def download_zlib(dest_dir, version=DEFAULT_ZLIB_VERSION):
     """Downloads zlib, returning the filename where the library was downloaded"""
+    if version is None:
+        version = DEFAULT_ZLIB_VERSION
     version_re = re.compile(r'zlib-([0-9.]+[0-9]).tar.gz')
     filename = 'zlib-%s.tar.gz'
-    return download_library(dest_dir, ZLIB_LOCATION, 'zlib',
-                            version_re, filename, version=version)
+    try:
+        return download_library(dest_dir, ZLIB_LOCATION, 'zlib',
+                                version_re, filename, version=version)
+    except IOError:
+        # zlib.net serves only the current release from its root directory;
+        # every superseded release - including the one this lxml version was
+        # built against - is moved to the "fossils" archive.
+        stale = os.path.join(dest_dir, filename % version)
+        if os.path.exists(stale):
+            # a failed urlretrieve can leave the error body behind, which would
+            # then be "reused" instead of re-downloaded
+            os.unlink(stale)
+        return download_library(dest_dir, ZLIB_LOCATION + 'fossils/', 'zlib',
+                                version_re, filename, version=version)
 
 
 def find_max_version(libname, filenames, version_re=None):

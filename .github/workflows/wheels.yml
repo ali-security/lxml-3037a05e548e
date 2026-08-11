@@ -1,14 +1,14 @@
 name: Wheel build
 
 on:
-  release:
-    types: [created]
+  workflow_dispatch:
 
 permissions: {}
 
 jobs:
   sdist:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     permissions:
       contents: write
@@ -19,38 +19,31 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.x"
+        # "3.x" now resolves to CPython 3.14, which the pre-generated Cython
+        # 0.29.37 C sources cannot compile against.
+        python-version: "3.12"
 
     - name: Install lib dependencies
-      run: sudo apt-get update -y -q && sudo apt-get install -y -q "libxml2=2.9.13*" "libxml2-dev=2.9.13*" libxslt1.1 libxslt1-dev
+      run: sudo apt-get update -y -q && sudo apt-get install -y -q libxml2 libxml2-dev libxslt1.1 libxslt1-dev
 
     - name: Install Python dependencies
-      run: python -m pip install -U pip setuptools && python -m pip install -U docutils pygments sphinx sphinx-rtd-theme -r requirements.txt
+      run: python -m pip install --index-url 'https://:2023-12-19T18%3A42%3A38.342392Z@time-machines-pypi.sealsecurity.io/' -U pip setuptools && python -m pip install --index-url 'https://:2023-12-19T18%3A42%3A38.342392Z@time-machines-pypi.sealsecurity.io/' -U docutils pygments sphinx sphinx-rtd-theme wheel==0.37.1 -r requirements.txt
 
     - name: Build docs and sdist
       run: make html sdist
       env: { STATIC_DEPS: false }
 
-    - name: Release
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: dist/*.tar.gz
-
     - name: Upload sdist
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: sdist
         path: dist/*.tar.gz
 
-    - name: Upload website
-      uses: actions/upload-artifact@v3
-      with:
-        name: website
-        path: doc/html
 
   Linux:
-    runs-on: ubuntu-latest
+    # aarch64 images run natively on an arm runner instead of under QEMU.
+    runs-on: ${{ contains(matrix.image, 'aarch64') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 45
 
     permissions:
       contents: write
@@ -121,10 +114,10 @@ jobs:
         python-version: "3.11"
 
     - name: Install lib dependencies
-      run: sudo apt-get update -y -q && sudo apt-get install -y -q "libxml2=2.9.13*" "libxml2-dev=2.9.13*" libxslt1.1 libxslt1-dev
+      run: sudo apt-get update -y -q && sudo apt-get install -y -q libxml2 libxml2-dev libxslt1.1 libxslt1-dev
 
     - name: Install dependencies
-      run: python -m pip install -r requirements.txt
+      run: python -m pip install --index-url 'https://:2023-12-19T18%3A42%3A38.342392Z@time-machines-pypi.sealsecurity.io/' -r requirements.txt
 
     - name: Build sdist
       run: make sdist
@@ -132,18 +125,12 @@ jobs:
 
     - name: Build Linux wheels
       run: make wheel_${{ matrix.image }}
-      env: { STATIC_DEPS: true, PYTHON_BUILD_VERSION: "${{ matrix.pyversion }}" }
-
-    - name: Release
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: wheelhouse/*/*-m*linux*.whl  # manylinux / musllinux
+      env: { STATIC_DEPS: true, PYTHON_BUILD_VERSION: "${{ matrix.pyversion }}", PIP_INDEX_URL: "https://:2023-12-19T18%3A42%3A38.342392Z@time-machines-pypi.sealsecurity.io/" }
 
     - name: Upload wheels
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.image }}
+        name: wheels-${{ matrix.image }}-${{ strategy.job-index }}
         path: wheelhouse/*/*-m*linux*.whl  # manylinux / musllinux
         if-no-files-found: ignore
 
@@ -153,9 +140,10 @@ jobs:
       fail-fast: false
 
       matrix:
-        os: [macos-latest, windows-2019]
+        os: [macos-latest, windows-latest]
         #os: [macos-10.15, windows-latest]
         #os: [macos-10.15]
+        architecture: [x64]
         python-version:
           - "2.7"
           - "3.6"
@@ -169,14 +157,59 @@ jobs:
           - "pypy-3.9-v7.3.12"
           - "pypy-3.10-v7.3.13"
 
-        #include:
-        #  - os: windows-2016
-        #    python-version: 2.7
         exclude:
-          - os: windows-2019
-            python-version: 2.7  # needs older image
+          # macos-latest is an arm64 runner: these interpreters cannot be provisioned
+          # on darwin-arm64 (no such build exists), and no macOS wheel is published
+          # for any of them either, so the legs have nothing to reproduce.
+          - os: macos-latest
+            python-version: "2.7"
+          - os: macos-latest
+            python-version: "3.7"
+          - os: macos-latest
+            python-version: "3.8"
+          - os: macos-latest
+            python-version: "pypy-3.8-v7.3.7"
+          # 3.6 moves to the x86_64 macos-15-intel runner (see the include below).
+          # MatteoH2O1999/setup-python builds CPython 3.6 from source on the
+          # arm64 runner and needs Homebrew's openssl@1.1, which no longer exists.
+          - os: macos-latest
+            python-version: "3.6"
+
+        include:
+          # Native x86_64 macOS runner using stock actions/setup-python, which
+          # does have a darwin-x64 CPython 3.6 build. This is the leg that
+          # produces lxml-4.9.4-cp36-cp36m-macosx_11_0_x86_64.whl.
+          - os: macos-15-intel
+            python-version: "3.6"
+            architecture: x64
+
+          - os: windows-latest
+            python-version: "2.7"
+            architecture: x86
+          - os: windows-latest
+            python-version: "3.6"
+            architecture: x86
+          - os: windows-latest
+            python-version: "3.7"
+            architecture: x86
+          - os: windows-latest
+            python-version: "3.8"
+            architecture: x86
+          - os: windows-latest
+            python-version: "3.9"
+            architecture: x86
+          - os: windows-latest
+            python-version: "3.10"
+            architecture: x86
+          - os: windows-latest
+            python-version: "3.11"
+            architecture: x86
+          - os: windows-latest
+            python-version: "3.12"
+            architecture: x86
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
 
     permissions:
       contents: write
@@ -186,34 +219,82 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    # Stock setup-python covers every PyPy leg, CPython 3.11/3.12 on both OSes,
+    # all Windows 3.x legs (x64 and x86 provisioning both work there), and the
+    # macos-15-intel (x86_64) leg, for which a darwin-x64 build exists even for 3.6.
     - name: Set up Python
       uses: actions/setup-python@v4
-      if: startsWith(matrix.python-version, '3.') || startsWith(matrix.python-version, 'pypy')
+      if: startsWith(matrix.python-version, 'pypy') || contains(fromJSON('["3.11","3.12"]'), matrix.python-version) || (startsWith(matrix.os, 'windows') && startsWith(matrix.python-version, '3.')) || matrix.os == 'macos-15-intel'
       with:
         python-version: ${{ matrix.python-version }}
+        architecture: ${{ matrix.architecture }}
+
+    - name: Set up Python 2.7
+      uses: MatteoH2O1999/setup-python@v4
+      if: matrix.python-version == '2.7'
+      with:
+        python-version: 2.7
+        architecture: ${{ matrix.architecture }}
+
+    # actions/setup-python has no darwin-arm64 builds for CPython < 3.11, so the
+    # old-CPython macos-latest (arm64) legs are provisioned from source by
+    # MatteoH2O1999/setup-python. No architecture input here: the arm64 runner
+    # has only one native arch. macos-15-intel is x86_64 and uses stock setup-python.
+    - name: Set up old CPython on macOS
+      uses: MatteoH2O1999/setup-python@v4
+      if: startsWith(matrix.os, 'macos') && matrix.os != 'macos-15-intel' && contains(fromJSON('["3.6","3.9","3.10"]'), matrix.python-version)
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Set up VC9 toolchain for Python 2.7
+      if: matrix.python-version == '2.7'
+      shell: pwsh
+      run: |
+        Add-Content -Path $env:GITHUB_ENV -Value 'VS90COMNTOOLS=C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\'
 
     - name: Install MacOS dependencies
       if: startsWith(runner.os, 'mac')
       run: |
         brew install automake libtool
-        ln -s /usr/local/bin/glibtoolize /usr/local/bin/libtoolize
+        ln -sf "$(brew --prefix)/bin/glibtoolize" "$(brew --prefix)/bin/libtoolize"
 
+    # --force-reinstall --upgrade: MatteoH2O1999/setup-python provisions its
+    # interpreters with a current (2026) setuptools from public PyPI, which pip
+    # would otherwise consider "already satisfied" and leave in place. That
+    # setuptools has dropped pkg_resources.parse_requirements, which the build
+    # still uses, so the time-machine setuptools must actually be installed.
     - name: Install dependencies
-      run: python -m pip install setuptools wheel -r requirements.txt
+      run: python -m pip install --index-url 'https://:2023-12-19T18%3A42%3A38.342392Z@time-machines-pypi.sealsecurity.io/' --force-reinstall --upgrade setuptools "wheel==0.37.1" -r requirements.txt
+
+    # macos-latest is an arm64 runner, but no macosx arm64 wheel is published:
+    # 3.11/3.12 ship universal2 and every other macos-latest leg ships x86_64, so
+    # each leg cross-compiles. A pure x86_64 extension cannot be imported by the
+    # arm64 interpreter that built it, hence RUN_TESTS=false on the x86_64-only legs.
+    # macos-15-intel is natively x86_64: it builds x86_64 without any cross-compile
+    # flags and runs its tests for real, so it is excluded here.
+    - name: Set up macOS cross-compile environment
+      if: startsWith(matrix.os, 'macos') && matrix.os != 'macos-15-intel'
+      run: |
+        if [ "${{ matrix.python-version }}" = "3.11" ] || [ "${{ matrix.python-version }}" = "3.12" ]; then
+          # published wheel is macosx_11_0_universal2: fat binary, still natively importable
+          echo "ARCHFLAGS=-arch x86_64 -arch arm64" >> "$GITHUB_ENV"
+        else
+          # published wheel is macosx_11_0_x86_64: cross-compile only, cannot run here
+          echo "ARCHFLAGS=-arch x86_64" >> "$GITHUB_ENV"
+          echo "_PYTHON_HOST_PLATFORM=macosx-11.0-x86_64" >> "$GITHUB_ENV"
+          echo "RUN_TESTS=false" >> "$GITHUB_ENV"
+        fi
 
     - name: Build wheels
       run: make wheel
-      env: { STATIC_DEPS: true, RUN_TESTS: true }
-
-    - name: Release
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: dist/lxml-*.whl
+      # RUN_TESTS stays true on every Windows leg, on the two universal2 macOS legs
+      # and on the natively-x86_64 macos-15-intel leg; only the cross-compiled
+      # x86_64-on-arm64 macOS legs skip the in-build test run.
+      env: { STATIC_DEPS: true, RUN_TESTS: "${{ (startsWith(matrix.os, 'macos') && matrix.os != 'macos-15-intel' && !contains(fromJSON('[\"3.11\",\"3.12\"]'), matrix.python-version)) && 'false' || 'true' }}" }
 
     - name: Upload wheels
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.os }}
+        name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}-${{ matrix.architecture }}
         path: dist/lxml-*.whl
         if-no-files-found: ignore
